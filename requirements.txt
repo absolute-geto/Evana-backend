@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+python-multipart
+yt-dlp
+Pillow
+imageio-ffmpeg
