@@ -1,6 +1,7 @@
-fastapi
-uvicorn[standard]
-python-multipart
-yt-dlp
-Pillow
-imageio-ffmpeg
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12
+yt-dlp>=2025.5.22
+Pillow==11.0.0
+imageio-ffmpeg==0.5.1
+bgutil-ytdlp-pot-provider

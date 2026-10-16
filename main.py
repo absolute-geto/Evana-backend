@@ -1,12 +1,14 @@
 """
 Evana Media Suite — Backend API
-- Video downloader via yt-dlp
+- Video downloader via yt-dlp (with cookies + PO Token support)
 - Image conversion via Pillow
 - Video/Audio conversion via ffmpeg
 """
 import os
 import uuid
 import shutil
+import base64
+import tempfile
 import asyncio
 from pathlib import Path
 from typing import Optional
@@ -30,18 +32,36 @@ CONVERTS.mkdir(parents=True, exist_ok=True)
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
+# ---------- YouTube PO Token Provider ----------
+# يمكن ضبطه من متغيرات البيئة في Render
+POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "")
+
+# ---------- Cookies from env ----------
+COOKIES_FILE = None
+_cookies_b64 = os.environ.get("YT_COOKIES_B64")
+if _cookies_b64:
+    try:
+        _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="wb")
+        _tmp.write(base64.b64decode(_cookies_b64))
+        _tmp.close()
+        COOKIES_FILE = _tmp.name
+        print(f"[Evana] Loaded cookies from env: {COOKIES_FILE}")
+    except Exception as e:
+        print(f"[Evana] Failed to load cookies: {e}")
+else:
+    print("[Evana] No cookies provided (YT_COOKIES_B64 not set)")
+
+# ---------- App ----------
 app = FastAPI(title="Evana API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # ← في الإنتاج ضيّقها على نطاقك
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- In-memory job stores ----------
-# (استبدلها بـ Redis / Firestore لو صار عندك ترافيك عالي)
 DOWNLOAD_JOBS: dict = {}
 CONVERT_JOBS: dict = {}
 
@@ -61,10 +81,40 @@ class DownloadRequest(BaseModel):
     audio_only: bool = False
 
 
+# ---------- Helper: build yt-dlp opts ----------
+def _base_ytdlp_opts() -> dict:
+    """الخيارات المشتركة بين get_info و download."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
+
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
+
+    # استخدم player_client يعتمد على JS + PO Token
+    youtube_args = {
+        "player_client": ["web_safari", "web", "tv_embedded"],
+    }
+    if POT_PROVIDER_URL:
+        youtube_args["po_token_provider"] = POT_PROVIDER_URL
+
+    opts["extractor_args"] = {"youtube": youtube_args}
+
+    return opts
+
+
 # ---------- Health ----------
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "Evana API", "ffmpeg": os.path.basename(FFMPEG)}
+    return {
+        "status": "ok",
+        "service": "Evana API",
+        "ffmpeg": os.path.basename(FFMPEG),
+        "cookies_loaded": COOKIES_FILE is not None,
+        "pot_provider": POT_PROVIDER_URL or "disabled",
+    }
 
 
 # ==========================================================
@@ -72,13 +122,10 @@ def health():
 # ==========================================================
 @app.post("/api/info")
 async def get_info(req: InfoRequest):
-    """جلب معلومات الفيديو (عنوان، صورة، صيغ متاحة) بدون تحميل."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-    }
+    """جلب معلومات الفيديو بدون تحميل."""
+    ydl_opts = _base_ytdlp_opts()
+    ydl_opts["skip_download"] = True
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(req.url, download=False)
@@ -106,7 +153,6 @@ async def get_info(req: InfoRequest):
             "is_audio_only": f.get("vcodec") == "none",
         })
 
-    # نظّف الترتيب: أفضل جودة أولاً
     formats.sort(key=lambda x: (x["is_audio_only"], -(x["filesize"] or 0)))
 
     return {
@@ -115,7 +161,7 @@ async def get_info(req: InfoRequest):
         "duration": info.get("duration"),
         "uploader": info.get("uploader"),
         "webpage_url": info.get("webpage_url"),
-        "formats": formats[:40],   # حد معقول للعرض
+        "formats": formats[:40],
     }
 
 
@@ -146,16 +192,15 @@ def _run_download(job_id: str, url: str, format_id: Optional[str], audio_only: b
     else:
         fmt = "bestvideo+bestaudio/best"
 
-    ydl_opts = {
+    ydl_opts = _base_ytdlp_opts()
+    ydl_opts.update({
         "outtmpl": str(job_dir / "%(title).120s.%(ext)s"),
         "format": fmt,
         "progress_hooks": [hook],
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
         "ffmpeg_location": FFMPEG,
         "merge_output_format": "mp4",
-    }
+    })
+
     if audio_only:
         ydl_opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
@@ -171,7 +216,7 @@ def _run_download(job_id: str, url: str, format_id: Optional[str], audio_only: b
         if not files:
             raise RuntimeError("No output file produced")
 
-        output = max(files, key=lambda p: p.stat().st_size)  # أكبر ملف = الناتج النهائي
+        output = max(files, key=lambda p: p.stat().st_size)
 
         DOWNLOAD_JOBS[job_id].update({
             "status": "completed",
@@ -226,7 +271,6 @@ async def _ffmpeg_convert(input_path: Path, output_path: Path, target: str):
     cmd = [FFMPEG, "-y", "-i", str(input_path)]
 
     if target in ("mp3", "wav", "aac", "flac", "ogg", "m4a"):
-        # استخراج صوت
         cmd += ["-vn"]
         if target == "mp3":
             cmd += ["-acodec", "libmp3lame", "-b:a", "192k"]
@@ -235,11 +279,11 @@ async def _ffmpeg_convert(input_path: Path, output_path: Path, target: str):
         else:
             cmd += ["-acodec", target]
     elif target in ("mp4", "mkv", "webm"):
-        # تحويل فيديو
         if target == "webm":
             cmd += ["-c:v", "libvpx-vp9", "-c:a", "libopus", "-b:v", "2M"]
         else:
-            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "192k"]
+            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "192k"]
     else:
         cmd += ["-c", "copy"]
 
@@ -260,10 +304,6 @@ async def convert_file(
     file: UploadFile = File(...),
     target: str = Form(...),
 ):
-    """
-    target = الامتداد المطلوب بدون نقطة
-             مثال: png / webp / jpg / mp4 / mp3
-    """
     target = target.lower().strip().lstrip(".")
     job_id = uuid.uuid4().hex
     job_dir = CONVERTS / job_id
@@ -277,7 +317,6 @@ async def convert_file(
     output_path = job_dir / f"{input_path.stem}.{target}"
 
     try:
-        # -------- IMAGE --------
         if ext in IMAGE_EXTS:
             img = Image.open(input_path)
             save_fmt = {"jpg": "JPEG", "jpeg": "JPEG"}.get(target, target.upper())
@@ -287,7 +326,6 @@ async def convert_file(
                 img = img.convert("RGBA") if img.mode in ("RGBA", "LA", "P") else img.convert("RGB")
             img.save(output_path, format=save_fmt)
 
-        # -------- VIDEO / AUDIO --------
         elif ext in VIDEO_EXTS or ext in AUDIO_EXTS:
             await _ffmpeg_convert(input_path, output_path, target)
 
@@ -296,7 +334,6 @@ async def convert_file(
 
         CONVERT_JOBS[job_id] = {"path": str(output_path), "filename": output_path.name}
 
-        # نظّف الملف الأصلي لتوفير مساحة
         try:
             input_path.unlink()
         except Exception:

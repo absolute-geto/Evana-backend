@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  # 1. خدمة الباكند الخاصة بك
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./backend:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    depends_on:
+      - pot-provider
+    networks:
+      - evana-net
+
+  # 2. خدمة مزود PO Token
+  pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    restart: unless-stopped
+    networks:
+      - evana-net
+
+networks:
+  evana-net:
+    driver: bridge
